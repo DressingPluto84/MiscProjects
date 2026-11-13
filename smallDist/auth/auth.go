@@ -10,30 +10,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	grpc "google.golang.org/grpc"
 )
 
 type accountError struct {
 	message string
 }
 
+type authServer struct {
+	UnimplementedAuthServer
+}
+
 // rs256 token
 type JWTType struct {
-	alg string // rs256
-	typ string // JWT
-	kid string // key id
+	Alg string `json:"alg"` // rs256
+	Typ string `json:"typ"` // JWT
+	Kid string `json:"kid"` // key id
 }
 
 // rs256 payload
 type JWTPayload struct {
-	sub  string // uid
-	role string // role
-	iat  int64  // valid starting
-	exp  int64  // expiry
+	Sub  string `json:"sub"`  // uid
+	Role string `json:"role"` // role
+	Iat  int64  `json:"iat"`  // valid starting
+	Exp  int64  `json:"exp"`  // expiry
 }
 
 type loginPayload struct {
@@ -76,8 +82,7 @@ func login(rdb *redis.Client, ctx context.Context, user string, pass string) (st
 		return "", err
 	}
 
-	actualSalted := getSaltedPass(val)
-	if actualSalted != newPass {
+	if val != newPass {
 		return "", &accountError{"Incorrect Password"}
 	}
 
@@ -132,22 +137,22 @@ func getJWT(user string) (string, error) {
 	}
 
 	cur := time.Now()
-	exp := cur.Add(600 * time.Second)
+	exp := cur.Add(300 * time.Second)
 	payload := JWTPayload{user, "user", cur.Unix(), exp.Unix()}
 	pe, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
 
-	headString := b64.StdEncoding.EncodeToString([]byte(he))
-	payloadString := b64.StdEncoding.EncodeToString([]byte(pe))
-	firstTwoParts := fmt.Sprint("%s.%s", headString, payloadString)
+	headString := b64.RawURLEncoding.EncodeToString([]byte(he))
+	payloadString := b64.RawURLEncoding.EncodeToString([]byte(pe))
+	firstTwoParts := fmt.Sprintf("%s.%s", headString, payloadString)
 
 	h := sha256.New()
 	h.Write([]byte(firstTwoParts))
 	encoded := h.Sum(nil)
 
-	priv, err := getKeys()
+	priv, err := getPrivateKey()
 	if err != nil {
 		return "", err
 	}
@@ -156,12 +161,77 @@ func getJWT(user string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	signature := b64.StdEncoding.EncodeToString(ret)
+	signature := b64.RawURLEncoding.EncodeToString(ret)
 
 	return fmt.Sprintf("%s.%s", firstTwoParts, signature), nil
 }
 
-func loginApi(w http.ResponseWriter, req *http.Request) {
+func verifyJWT(jwt string, user string, role string) error {
+	parts := strings.Split(jwt, ".")
+	if len(parts) != 3 {
+		return &accountError{"Bad Token Split"}
+	}
+
+	head := make([]byte, b64.RawURLEncoding.DecodedLen(len(parts[0])))
+	pay := make([]byte, b64.RawURLEncoding.DecodedLen(len(parts[1])))
+
+	_, err := b64.RawURLEncoding.Decode(head, []byte(parts[0]))
+	if err != nil {
+		return err
+	}
+	_, err = b64.RawURLEncoding.Decode(pay, []byte(parts[1]))
+	if err != nil {
+		return err
+	}
+
+	var header JWTType
+	var payload JWTPayload
+
+	err = json.Unmarshal(head, &header)
+	if err != nil {
+		return err
+	}
+
+	err = json.Unmarshal(pay, &payload)
+	if err != nil {
+		return err
+	}
+
+	if !(header.Alg == "RS256" && header.Typ == "JWT" && header.Kid == "kid_v1") {
+		return &accountError{"Incorrect JWT header"}
+	}
+
+	currTime := time.Now().Unix()
+	if payload.Sub != user || payload.Role != role || payload.Iat > currTime || payload.Exp < currTime {
+		return &accountError{"Incorrect JWT payload"}
+	}
+
+	firstTwoParts := fmt.Sprintf("%s.%s", parts[0], parts[1])
+
+	h := sha256.New()
+	h.Write([]byte(firstTwoParts))
+	encoded := h.Sum(nil)
+
+	pub, err := getPublicKey()
+	if err != nil {
+		return err
+	}
+
+	dec := make([]byte, b64.RawURLEncoding.DecodedLen(len(parts[2])))
+	_, err = b64.RawURLEncoding.Decode(dec, []byte(parts[2]))
+	if err != nil {
+		return err
+	}
+
+	err = rsa.VerifyPKCS1v15(pub, crypto.SHA256, encoded, dec)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateAccountRequest(w http.ResponseWriter, req *http.Request, b *map[string]string) error {
 	response := make(map[string]any)
 
 	if req.Method != "POST" {
@@ -172,7 +242,7 @@ func loginApi(w http.ResponseWriter, req *http.Request) {
 
 		res, _ := json.Marshal(response)
 		w.Write([]byte(res))
-		return
+		return &accountError{"NotFound"}
 	}
 
 	body, err := io.ReadAll(req.Body)
@@ -184,11 +254,10 @@ func loginApi(w http.ResponseWriter, req *http.Request) {
 
 		res, _ := json.Marshal(response)
 		w.Write([]byte(res))
-		return
+		return &accountError{"InternalServerError"}
 	}
 
-	b := make(map[string]string)
-	err = json.Unmarshal(body, &b)
+	err = json.Unmarshal(body, b)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		response["error"] = "InternalServerError"
@@ -197,10 +266,10 @@ func loginApi(w http.ResponseWriter, req *http.Request) {
 
 		res, _ := json.Marshal(response)
 		w.Write([]byte(res))
-		return
+		return &accountError{"InternalServerError"}
 	}
 
-	if b["user"] == "" || b["pass"] == "" {
+	if (*b)["user"] == "" || (*b)["pass"] == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		response["error"] = "BadRequest"
 		response["message"] = "Empty Username or Password"
@@ -208,15 +277,26 @@ func loginApi(w http.ResponseWriter, req *http.Request) {
 
 		res, _ := json.Marshal(response)
 		w.Write([]byte(res))
+		return &accountError{"BadRequest"}
+	}
+
+	return nil
+}
+
+func loginApi(w http.ResponseWriter, req *http.Request) {
+	b := make(map[string]string)
+	response := make(map[string]any)
+	ret := validateAccountRequest(w, req, &b)
+	if ret != nil {
 		return
 	}
 
 	jwt, err := login(RedisConnection, Ctx, b["user"], b["pass"])
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		response["error"] = "BadRequest"
-		response["message"] = "Invalid Username or Password"
-		response["status"] = 400
+		w.WriteHeader(http.StatusUnauthorized)
+		response["error"] = "Unauthorized"
+		response["message"] = "Error Logging In"
+		response["status"] = 401
 
 		res, _ := json.Marshal(response)
 		w.Write([]byte(res))
@@ -229,7 +309,64 @@ func loginApi(w http.ResponseWriter, req *http.Request) {
 	w.Write([]byte(res))
 }
 
+func createAccountApi(w http.ResponseWriter, req *http.Request) {
+	b := make(map[string]string)
+	response := make(map[string]any)
+	ret := validateAccountRequest(w, req, &b)
+	if ret != nil {
+		return
+	}
+
+	jwt, err := createAccount(RedisConnection, Ctx, b["user"], b["pass"])
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		response["error"] = "Unauthorized"
+		response["message"] = "Error Creating Account"
+		response["status"] = 401
+
+		fmt.Println(err)
+		res, _ := json.Marshal(response)
+		w.Write([]byte(res))
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	response["auth"] = jwt
+	res, _ := json.Marshal(response)
+	w.Write([]byte(res))
+}
+
+func (s *authServer) VerifyToken(ctx context.Context, req *Token) (*Validation, error) {
+	jwt := req.GetToken()
+	user := req.GetUser()
+	role := req.GetRole()
+
+	err := verifyJWT(jwt, user, role)
+	if err != nil {
+		return &Validation{Resp: false}, err
+	}
+
+	return &Validation{Resp: true}, nil
+}
+
 func main() {
+	go func() {
+		lis, err := net.Listen("tcp", ":50051")
+		if err != nil {
+			fmt.Println("Failed to open port")
+			return
+		}
+
+		grpcServer := grpc.NewServer()
+		RegisterAuthServer(grpcServer, &authServer{})
+
+		if err := grpcServer.Serve(lis); err != nil {
+			fmt.Println("Failed to bind grpc")
+			return
+		}
+	}()
+
+	http.HandleFunc("/signup", createAccountApi)
 	http.HandleFunc("/login", loginApi)
 	http.ListenAndServe(":3000", nil)
 }

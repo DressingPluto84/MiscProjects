@@ -13,21 +13,16 @@ type loginPayload struct {
 	Pass string `json:"pass"`
 }
 
+type writePayload struct {
+	Thing string `json:"thing"`
+}
+
 func main() {
-	url := "http://localhost:3000/login"
+	auth := "http://localhost:3000/login"
+	service := "http://localhost:3001/write"
 
-	user := "Anish"
-	pass := "Poo12345@"
-	/*
-		var opt int
-
-		fmt.Print("Create Account (0), Login (1): ")
-		fmt.Scanln(&opt)
-		fmt.Print("Enter Username: ")
-		fmt.Scanln(&user)
-		fmt.Print("Enter Password: ")
-		fmt.Scanln(&pass)
-	*/
+	user := "user"
+	pass := "pass"
 
 	p := loginPayload{user, pass}
 	body, err := json.Marshal(p)
@@ -37,7 +32,7 @@ func main() {
 	}
 
 	client := &http.Client{}
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	req, err := http.NewRequest("POST", auth, bytes.NewBuffer(body))
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -49,5 +44,44 @@ func main() {
 	r, _ := io.ReadAll(resp.Body)
 	respBody := make(map[string]string)
 	_ = json.Unmarshal(r, &respBody)
-	fmt.Println(respBody)
+	jwt := respBody["auth"]
+
+	if jwt == "" {
+		fmt.Println(respBody)
+		fmt.Println("Failed")
+	}
+
+	pay := writePayload{"thingy"}
+	body, err = json.Marshal(pay)
+
+	req, err = http.NewRequest("POST", service, bytes.NewBuffer(body))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authentication", jwt)
+	req.Header.Add("User", "Janish")
+	_, _ = client.Do(req)
+
+	req, err = http.NewRequest("GET", "http://localhost:3001/read/0", bytes.NewBuffer([]byte("")))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authentication", jwt)
+	req.Header.Add("User", "Janish")
+
+	resp, err = client.Do(req)
+	r, _ = io.ReadAll(resp.Body)
+	respBody = make(map[string]string)
+	_ = json.Unmarshal(r, &respBody)
+
+	if err != nil {
+		fmt.Println(err)
+	} else {
+		fmt.Println(resp.StatusCode)
+		fmt.Println(respBody)
+	}
 }
